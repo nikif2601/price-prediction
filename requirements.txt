@@ -1,7 +1,9 @@
 streamlit
 pandas
 numpy
+requests
+lxml
 scikit-learn
 joblib
 statsmodels
-lxml
+

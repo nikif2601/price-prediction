@@ -26,39 +26,36 @@ CACHE_TTL = 24 * 60 * 60  # 1 ден кеш
 # ==================== ЗАРЕЖДАНЕ НА ЦЕНОВИ ДАННИ ОТ IBEX ====================
 @st.cache_data(ttl=CACHE_TTL)
 def fetch_ibex_data():
-    """Изтегля исторически ден-напред цени директно от сайта на IBEX чрез scrape на HTML таблици."""
-    records = []
-    end = datetime.now(tz=LOCAL_ZONE).date() - timedelta(days=1)
-    start = end - timedelta(days=YEARS_BACK * 365)
-    for single_date in pd.date_range(start, end, freq='D'):
-        date_str = single_date.strftime('%Y-%m-%d')
-        url = f"https://www.ibex.bg/bg/dna/index.php?mn=140&dd={date_str}"
-        try:
-            tables = pd.read_html(url)
-        except Exception as e:
-            st.warning(f"Неуспех при зареждане на IBEX за {date_str}: {e}")
-            continue
-        # Опитваме се да намерим таблица с часове и цени
-        for df_day in tables:
-            if 'Час' in df_day.columns and 'Цена' in df_day.columns:
-                for _, row in df_day.iterrows():
-                    try:
-                        hour = int(row['Час'])
-                        price = float(str(row['Цена']).replace(',', '.'))
-                    except:
-                        continue
-                    records.append({'date': single_date.date(), 'hour': hour, 'price': price})
-                break
-    if not records:
-        st.error("Не са намерени данни на IBEX за зададения период.")
+    """Изтегля исторически ден-напред цени чрез CSV download от ENTSO-E Transparency Platform."""
+    end = pd.Timestamp.utcnow().floor('D') - pd.Timedelta(days=1)
+    start = end - pd.Timedelta(days=YEARS_BACK * 365)
+    params = {
+        'documentType': 'A44',
+        'in_Domain': '10YBG-ESO------Y',
+        'out_Domain': '10YBG-ESO------Y',
+        'periodStart': start.strftime('%Y%m%d') + '0000',
+        'periodEnd': end.strftime('%Y%m%d') + '2300',
+        'securityToken': st.secrets['ENTSOE_API_KEY'],
+        'fileType': 'CSV'
+    }
+    url = 'https://transparency.entsoe.eu/api?download'
+    r = requests.get(url, params=params)
+    if r.status_code != 200:
+        st.error(f"Неуспешно изтегляне на CSV: HTTP {r.status_code}")
         return pd.DataFrame()
-    df = pd.DataFrame(records)
-    df['datetime'] = pd.to_datetime(df['date']) + pd.to_timedelta(df['hour'], unit='h')
-    df['datetime'] = df['datetime'].dt.tz_localize(LOCAL_ZONE)
-    pivot = df.pivot(index='date', columns='hour', values='price')
+    try:
+        from io import StringIO
+        df_csv = pd.read_csv(StringIO(r.text), sep=';', skiprows=1)
+    except Exception as e:
+        st.error(f"Грешка при парсване на CSV: {e}")
+        return pd.DataFrame()
+    # Предполага колони: DateTime;Price
+    df_csv['datetime'] = pd.to_datetime(df_csv['DateTime'], utc=True).dt.tz_convert(LOCAL_ZONE)
+    df_csv['date'] = df_csv['datetime'].dt.date
+    df_csv['hour'] = df_csv['datetime'].dt.hour
+    pivot = df_csv.pivot_table(index='date', columns='hour', values='Price')
     pivot.columns = [f'hour_{h}' for h in pivot.columns]
-    pivot = pivot.reset_index()
-    return pivot
+    return pivot.reset_index()
 
 # ==================== ЗАРЕЖДАНЕ НА МЕТЕО ДАННИ ====================
 @st.cache_data(ttl=CACHE_TTL)

@@ -29,31 +29,75 @@ WEATHER_API_KEY = st.secrets.get("WEATHER_API_KEY")
 # ==================== ФУНКЦИИ ====================
 @st.cache_data(ttl=CACHE_TTL)
 def fetch_ibex_data():
-    client = EntsoePandasClient(api_key=ENTSOE_API_KEY,
-                                 base_url="https://web-api.tp.entsoe.eu/api")
+    """Изтегля исторически ден-напред цени директно от сайта на IBEX чрез scrape на HTML таблици."""
+    records = []
     end = pd.Timestamp.utcnow().floor('D') - pd.Timedelta(days=1)
     start = end - pd.Timedelta(days=YEARS_BACK*365)
-    start_utc = start.tz_localize(timezone.utc)
-    end_utc = end.tz_localize(timezone.utc) + pd.Timedelta(hours=23)
-    try:
-        # използваме новия REST endpoint, чрез base_url
-        series = client.query_day_ahead_prices(
-            country_code='BG', start=start_utc, end=end_utc
-        )
-    except Exception as e:
-        st.error(f"Грешка от ENTSO-E API: {e}")
+    for single_date in pd.date_range(start, end, freq='D'):
+        date_str = single_date.strftime('%Y-%m-%d')
+        url = f"https://www.ibex.bg/bg/dna/index.php?mn=140&dd={date_str}"
+        try:
+            tables = pd.read_html(url)
+        except Exception as e:
+            st.warning(f"Неуспех при зареждане на IBEX страница за {date_str}: {e}")
+            continue
+        # Предполага, че таблицата със стойности е втората таблица
+        if len(tables) < 2:
+            st.warning(f"Няма таблица за {date_str}")
+            continue
+        df_day = tables[1]
+        # Очаква колони: 'Час' и 'Цена'
+        if 'Час' not in df_day.columns or 'Цена' not in df_day.columns:
+            st.warning(f"Неочаквани колони на IBEX за {date_str}")
+            continue
+        for _, row in df_day.iterrows():
+            try:
+                hour = int(row['Час'])
+                price = float(str(row['Цена']).replace(',', '.'))
+            except:
+                continue
+            records.append({'date': single_date.date(), 'hour': hour, 'price': price})
+    if not records:
+        st.error("Не са намерени данни на IBEX за посочения период.")
         return pd.DataFrame()
-    if series.empty:
-        st.error("Не са намерени данни от ENTSO-E API за зададения период.")
-        return pd.DataFrame()
-    df = series.reset_index()
-    df.columns = ['datetime', 'price']
-    df['datetime'] = df['datetime'].dt.tz_convert(LOCAL_ZONE)
-    df['date'] = df['datetime'].dt.date
-    df['hour'] = df['datetime'].dt.hour
+    df = pd.DataFrame(records)
+    df['datetime'] = pd.to_datetime(df['date']) + pd.to_timedelta(df['hour'], unit='h')
+    df['datetime'] = df['datetime'].dt.tz_localize(LOCAL_ZONE)
     pivot = df.pivot(index='date', columns='hour', values='price')
     pivot.columns = [f'hour_{h}' for h in pivot.columns]
     return pivot.reset_index()
+    except Exception:
+        pass
+    # Fallback: direct CSV download
+    st.info("Използва се CSV fallback за IBEX цени")
+    end = pd.Timestamp.utcnow().floor('D') - pd.Timedelta(days=1)
+    start = end - pd.Timedelta(days=YEARS_BACK*365)
+    url = "https://transparency.entsoe.eu/api"
+    params = {
+        'documentType': 'A44',
+        'in_Domain': '10YBG-ESO------Y',
+        'out_Domain': '10YBG-ESO------Y',
+        'periodStart': start.strftime('%Y%m%d') + '0000',
+        'periodEnd': end.strftime('%Y%m%d') + '2300',
+        'securityToken': ENTSOE_API_KEY,
+        'download': 'true'
+    }
+    r = requests.get(url, params=params)
+    if r.status_code != 200:
+        st.error(f"CSV fallback error: {r.status_code}")
+        return pd.DataFrame()
+    from io import StringIO
+    try:
+        df_csv = pd.read_csv(StringIO(r.text), sep=';')
+        df_csv['datetime'] = pd.to_datetime(df_csv['DateTime'], utc=True).dt.tz_convert(LOCAL_ZONE)
+        df_csv['date'] = df_csv['datetime'].dt.date
+        df_csv['hour'] = df_csv['datetime'].dt.hour
+        pivot = df_csv.pivot_table(index='date', columns='hour', values='Price')
+        pivot.columns = [f'hour_{h}' for h in pivot.columns]
+        return pivot.reset_index()
+    except Exception as e:
+        st.error(f"CSV parsing error: {e}")
+        return pd.DataFrame()
 
 @st.cache_data(ttl=CACHE_TTL)
 def fetch_weather_history(lat, lon):
@@ -186,4 +230,5 @@ def main():
 
 if __name__ == '__main__':
     main()
+
 

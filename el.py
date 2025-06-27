@@ -76,7 +76,9 @@ def fetch_weather_history(lat: float, lon: float, start: datetime, end: datetime
     records = []
     date = start
     while date <= end:
-        ts = int(date.replace(hour=12).timestamp())
+        # Изграждаме datetime обект за 12:00 на дадената дата
+        dt_noon = datetime(year=date.year, month=date.month, day=date.day, hour=12)
+        ts = int(dt_noon.timestamp())
         url = "https://api.openweathermap.org/data/2.5/onecall/timemachine"
         params = {'lat': lat, 'lon': lon, 'dt': ts, 'appid': WEATHER_API_KEY, 'units': 'metric'}
         j = requests.get(url, params=params).json()
@@ -211,3 +213,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+

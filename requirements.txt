@@ -6,6 +6,4 @@ lxml
 scikit-learn
 joblib
 statsmodels
-entsoe-py
 pytz
-

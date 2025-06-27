@@ -1,10 +1,9 @@
 streamlit
 pandas
 numpy
-requests
-lxml
 scikit-learn
+entsoe-py
+requests
 joblib
 statsmodels
-pytz
-entsoe-py
+

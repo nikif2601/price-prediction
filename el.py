@@ -29,7 +29,7 @@ CACHE_TTL = 24 * 60 * 60  # 1 ден
 # ==================== ФУНКЦИИ ЗА ЗАРЕЖДАНЕ НА ДАННИ ====================
 @st.cache_data(ttl=CACHE_TTL)
 def fetch_ibex_day_ahead(start_date: str, end_date: str) -> pd.DataFrame:
-    """Извлича исторически цени Ден Напред от ENTSO-E API."""
+    """Извлича исторически цени Ден Напред от ENTSO-E API, парсвайки XML чрез ElementTree."""
     url = "https://transparency.entsoe.eu/api"
     params = {
         'documentType': 'A44',
@@ -40,17 +40,36 @@ def fetch_ibex_day_ahead(start_date: str, end_date: str) -> pd.DataFrame:
         'securityToken': ENTSOE_API_KEY
     }
     r = requests.get(url, params=params)
-    # Опит за парсване с pandas; изисква lxml
     try:
-        df_raw = pd.read_xml(r.content, xpath='//TimeSeries')
-    except ImportError:
-        st.error("Моля, добавете 'lxml' в requirements.txt и презаредете приложението.")
+        root = ET.fromstring(r.content)
+    except ET.ParseError:
+        st.error("Грешка при парсване на XML от ENTSO-E API.")
         return pd.DataFrame()
-    df_raw['date'] = pd.to_datetime(df_raw['timeStamp']).dt.date
-    df_raw['hour'] = pd.to_datetime(df_raw['timeStamp']).dt.hour
-    df = df_raw.pivot_table(index='date', columns='hour', values='price.amount')
-    df.columns = [f'hour_{h}' for h in df.columns]
-    return df.reset_index()
+    # Определяме namespace
+    ns = {None: root.tag.split('}')[0].strip('{')}
+    data = []
+    # Обхождаме всички TimeSeries
+    for ts in root.findall('.//{'+ns[None]+'}TimeSeries'):
+        # Период
+        period = ts.find('.//{'+ns[None]+'}Period')
+        start_ts = period.find('{'+ns[None]+'}timeInterval/{'+ns[None]+'}start').text
+        dt_start = datetime.fromisoformat(start_ts)
+        # Точки
+        for pt in period.findall('{'+ns[None]+'}Point'):
+            pos = int(pt.find('{'+ns[None]+'}position').text)
+            price = float(pt.find('{'+ns[None]+'}price.amount').text)
+            dt = dt_start + timedelta(hours=pos-1)
+            data.append({'datetime': dt, 'price': price})
+    df = pd.DataFrame(data)
+    if df.empty:
+        st.error("Няма данни от ENTSO-E API за посочения период.")
+        return df
+    df['date'] = df['datetime'].dt.date
+    df['hour'] = df['datetime'].dt.hour
+    df_pivot = df.pivot(index='date', columns='hour', values='price')
+    df_pivot.columns = [f'hour_{h}' for h in df_pivot.columns]
+    df_pivot = df_pivot.reset_index()
+    return df_pivot
 
 @st.cache_data(ttl=CACHE_TTL)
 def fetch_weather_history(lat: float, lon: float, start: datetime, end: datetime) -> pd.DataFrame:
@@ -192,7 +211,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
-
-
-

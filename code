@@ -1,0 +1,131 @@
+import pandas as pd
+import numpy as np
+from sklearn.model_selection import TimeSeriesSplit
+from sklearn.metrics import mean_absolute_error, mean_squared_error
+from sklearn.ensemble import GradientBoostingRegressor
+from sklearn.preprocessing import StandardScaler
+import joblib
+
+
+def load_weather_data(weather_csv):
+    """
+    Зарежда историческите метеорологични данни от CSV файл.
+    Очаква колони: 'date' (datetime), 'avg_temp', 'avg_wind_speed', 'solar_radiation'.
+    """
+    dfw = pd.read_csv(weather_csv, parse_dates=['date'])
+    dfw = dfw.sort_values('date').reset_index(drop=True)
+    return dfw
+
+
+def load_ibex_data(price_csv, weather_csv=None):
+    """
+    Зарежда историческите цени от CSV файл и (по избор) слепва метео-данни.
+    Очаква 'date' колона и 24 колони за всеки час (hour_0 ... hour_23).
+    Ако weather_csv е подаден, очаква и агрегирани метео-данни по ден.
+    """
+    df = pd.read_csv(price_csv, parse_dates=['date'])
+    df = df.sort_values('date').reset_index(drop=True)
+
+    if weather_csv:
+        dfw = load_weather_data(weather_csv)
+        df = df.merge(dfw, on='date', how='left')
+    return df
+
+
+def create_features(df):
+    """
+    Създава календарни, лагови и метео характеристики.
+    """
+    data = df.copy()
+    data['dayofweek'] = data['date'].dt.dayofweek
+    data['is_weekend'] = data['dayofweek'].isin([5,6]).astype(int)
+
+    # Лагови стойности на цените: вчера и преди седмица
+    for lag in [1, 7]:
+        lag_price = [f'hour_{h}_lag{lag}' for h in range(24)]
+        data[lag_price] = data[[f'hour_{h}' for h in range(24)]].shift(lag)
+
+    # Лаг за основните метео променливи (само вчерашните стойности)
+    if 'avg_temp' in data.columns:
+        for col in ['avg_temp', 'avg_wind_speed', 'solar_radiation']:
+            data[f'{col}_lag1'] = data[col].shift(1)
+
+    # Премахваме първите 7 реда с NaN
+    data = data.dropna().reset_index(drop=True)
+    return data
+
+
+def prepare_dataset(data, target_hour):
+    """
+    Подготвя X и y за даден час (0–23).
+    """
+    # Премахваме колони, които не са признаци
+    price_cols = [f'hour_{h}' for h in range(24)]
+    non_features = ['date'] + price_cols
+    X = data.drop(columns=non_features)
+    y = data[f'hour_{target_hour}']
+    return X, y
+
+
+def train_model(X, y):
+    """
+    Тренира GBDT регресор върху набора от данни.
+    Извежда крос-валидационна MAE/RMSE и запазва финалния модел и скейлър.
+    """
+    tscv = TimeSeriesSplit(n_splits=5)
+    scaler = StandardScaler()
+    X_scaled = scaler.fit_transform(X)
+    maes, rmses = [], []
+
+    for train_idx, val_idx in tscv.split(X_scaled):
+        X_train, X_val = X_scaled[train_idx], X_scaled[val_idx]
+        y_train, y_val = y.iloc[train_idx], y.iloc[val_idx]
+
+        model = GradientBoostingRegressor(n_estimators=200, learning_rate=0.05, max_depth=4)
+        model.fit(X_train, y_train)
+        preds = model.predict(X_val)
+        maes.append(mean_absolute_error(y_val, preds))
+        rmses.append(mean_squared_error(y_val, preds, squared=False))
+
+    print(f"CV MAE: {np.mean(maes):.3f}, RMSE: {np.mean(rmses):.3f}")
+
+    # Финално обучение върху цялата история
+    model_final = GradientBoostingRegressor(n_estimators=200, learning_rate=0.05, max_depth=4)
+    model_final.fit(X_scaled, y)
+
+    joblib.dump(model_final, 'ibex_gbdt_model.pkl')
+    joblib.dump(scaler, 'ibex_scaler.pkl')
+    return model_final, scaler
+
+
+def forecast_next_day(df_hist, model, scaler):
+    """
+    Прогнозира цените за следващия ден (24-часова вълна).
+    В текущата версия не използва прогноза за времето — очаква, че ще предоставите и weather_fc.
+    """
+    df_feat = create_features(df_hist)
+    last = df_feat.iloc[[-1]].copy()
+
+    preds = []
+    for hour in range(24):
+        X_pred = last.drop(columns=[f'hour_{h}' for h in range(24)])
+        X_scaled = scaler.transform(X_pred)
+        p = model.predict(X_scaled)[0]
+        preds.append(p)
+        # Обновяваме лаг1 за следващ час
+        last[f'hour_{hour}_lag1'] = p
+    return preds
+
+
+if __name__ == '__main__':
+    # Пример за използване:
+    df = load_ibex_data('ibex_day_ahead.csv', weather_csv='weather_agg.csv')
+    df_feat = create_features(df)
+
+    # Обучение за час 0
+    X0, y0 = prepare_dataset(df_feat, target_hour=0)
+    model0, scaler0 = train_model(X0, y0)
+
+    # Прогноза за следващия ден (без weather forecast)
+    preds = forecast_next_day(df, model0, scaler0)
+    print("Прогнозирани цени за следващия ден:", preds)

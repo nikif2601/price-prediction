@@ -38,14 +38,17 @@ def fetch_ibex_day_ahead(start_date: str, end_date: str) -> pd.DataFrame:
         st.error("Моля, добавете 'entsoe-py' в requirements.txt и деплойнете отново.")
         return pd.DataFrame()
     client = EntsoePandasClient(api_key=ENTSOE_API_KEY)
-    # Форматиране на датите към timezone-aware
-    start = pd.Timestamp(start_date, tz=LOCAL_ZONE)
-    end = pd.Timestamp(end_date + 'T23:00', tz=LOCAL_ZONE)
-    # Запитване
+    # Форматиране на датите към UTC
+    start_utc = pd.Timestamp(start_date + 'T00:00:00', tz=timezone.utc)
+    end_utc = pd.Timestamp(end_date + 'T23:00:00', tz=timezone.utc)
+    # Запитване: entsoe-py ще използва правилния domain
     try:
-        ts = client.query_day_ahead_prices(country_code='BG', start=start, end=end)
+        ts = client.query_day_ahead_prices(country_code='BG', start=start_utc, end=end_utc)
     except Exception as e:
         st.error(f"ENTSO-E API client error: {e}")
+        return pd.DataFrame()
+    if ts.empty:
+        st.error("ENTSO-E API не върна данни за този период.")
         return pd.DataFrame()
     # Преобразуване на Series към DataFrame
     df = ts.reset_index()

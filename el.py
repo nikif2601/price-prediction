@@ -29,12 +29,14 @@ WEATHER_API_KEY = st.secrets.get("WEATHER_API_KEY")
 # ==================== ФУНКЦИИ ====================
 @st.cache_data(ttl=CACHE_TTL)
 def fetch_ibex_data():
-    client = EntsoePandasClient(api_key=ENTSOE_API_KEY)
+    client = EntsoePandasClient(api_key=ENTSOE_API_KEY,
+                                 base_url="https://web-api.tp.entsoe.eu/api")
     end = pd.Timestamp.utcnow().floor('D') - pd.Timedelta(days=1)
     start = end - pd.Timedelta(days=YEARS_BACK*365)
     start_utc = start.tz_localize(timezone.utc)
     end_utc = end.tz_localize(timezone.utc) + pd.Timedelta(hours=23)
     try:
+        # използваме новия REST endpoint, чрез base_url
         series = client.query_day_ahead_prices(
             country_code='BG', start=start_utc, end=end_utc
         )
@@ -184,3 +186,4 @@ def main():
 
 if __name__ == '__main__':
     main()
+

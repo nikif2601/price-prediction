@@ -31,7 +31,7 @@ CACHE_TTL = 24 * 60 * 60  # 1 ден
 # ==================== ФУНКЦИИ ЗА ЗАРЕЖДАНЕ НА ДАННИ ====================
 @st.cache_data(ttl=CACHE_TTL)
 def fetch_ibex_day_ahead(start_date: str, end_date: str) -> pd.DataFrame:
-    """Извлича исторически цени Ден Напред от ENTSO-E API, конвертира в локално време CET."""
+    """Извлича исторически цени Ден Напред от ENTSO-E API, конвертира в локално време CET и дебъгва при грешки."""
     url = "https://transparency.entsoe.eu/api"
     params = {
         'documentType': 'A44',
@@ -42,20 +42,44 @@ def fetch_ibex_day_ahead(start_date: str, end_date: str) -> pd.DataFrame:
         'securityToken': ENTSOE_API_KEY
     }
     r = requests.get(url, params=params)
+    # Debugging information
+    st.write(f"ENTSO-E request URL: {r.url}")
+    st.write(f"Status code: {r.status_code}")
+    content_snippet = r.content[:500].decode('utf-8', errors='replace')
+    st.write("Raw XML snippet:", content_snippet)
+    if r.status_code != 200:
+        st.error(f"ENTSO-E API error: status {r.status_code}")
+        return pd.DataFrame()
     try:
         root = ET.fromstring(r.content)
-    except ET.ParseError:
-        st.error("Грешка при парсване на XML от ENTSO-E API.")
+    except ET.ParseError as e:
+        st.error(f"Грешка при парсване на XML: {e}")
         return pd.DataFrame()
     ns = {None: root.tag.split('}')[0].strip('{')}
     data = []
     for ts in root.findall('.//{'+ns[None]+'}TimeSeries'):
         period = ts.find('.//{'+ns[None]+'}Period')
-        start_ts = period.find('{'+ns[None]+'}timeInterval/{'+ns[None]+'}start').text
-        dt_start = datetime.fromisoformat(start_ts).replace(tzinfo=timezone.utc)
+        if period is None:
+            continue
+        start_ts_el = period.find('{'+ns[None]+'}timeInterval/{'+ns[None]+'}start')
+        if start_ts_el is None or start_ts_el.text is None:
+            continue
+        start_ts = start_ts_el.text
+        try:
+            dt_start = datetime.fromisoformat(start_ts).replace(tzinfo=timezone.utc)
+        except ValueError:
+            st.warning(f"Невалиден формат на началото на периода: {start_ts}")
+            continue
         for pt in period.findall('{'+ns[None]+'}Point'):
-            pos = int(pt.find('{'+ns[None]+'}position').text)
-            price = float(pt.find('{'+ns[None]+'}price.amount').text)
+            pos_el = pt.find('{'+ns[None]+'}position')
+            price_el = pt.find('{'+ns[None]+'}price.amount')
+            if pos_el is None or price_el is None:
+                continue
+            try:
+                pos = int(pos_el.text)
+                price = float(price_el.text)
+            except (TypeError, ValueError):
+                continue
             dt_utc = dt_start + timedelta(hours=pos-1)
             dt_local = dt_utc.astimezone(LOCAL_ZONE)
             data.append({'datetime': dt_local, 'price': price})
@@ -182,8 +206,18 @@ def main():
     with st.spinner("Зареждане на данни..."):
         df_price = fetch_ibex_day_ahead(start_str, end_str)
         if df_price.empty:
+            st.error("Неуспешно зареждане на цени от ENTSO-E API.")
             return
         df_hist_weather = fetch_weather_history(42.7, 23.3, start, end)
+        if df_hist_weather.empty:
+            st.warning("Неуспешно зареждане на исторически метео данни. Ще бъдат използвани само ценови данни.")
+            # Създаваме празни метео колони, съвпадащи по дати
+            df_hist_weather = pd.DataFrame({
+                'date': df_price['date'],
+                'avg_temp': np.nan,
+                'avg_wind_speed': np.nan,
+                'solar_radiation': np.nan
+            })
         df = df_price.merge(df_hist_weather, on='date', how='left')
     st.success("Данните заредени")
     st.subheader("Анализ на връзката между цена и метео")
@@ -207,4 +241,6 @@ def main():
 
 if __name__ == "__main__":
     main()
+    main()
+
 

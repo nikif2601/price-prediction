@@ -1,114 +1,151 @@
+import os
 import streamlit as st
 import pandas as pd
 import numpy as np
+import requests
+from datetime import datetime, timedelta
 from sklearn.model_selection import TimeSeriesSplit
 from sklearn.metrics import mean_absolute_error, mean_squared_error
 from sklearn.ensemble import GradientBoostingRegressor
 from sklearn.preprocessing import StandardScaler
 import joblib
 
-# ==================== ДАННИ ====================
+# ==================== КОНФИГУРАЦИЯ ====================
+ENTSOE_API_KEY = st.secrets.get("ENTSOE_API_KEY")
+WEATHER_API_KEY = st.secrets.get("WEATHER_API_KEY")
 
-def load_weather_data(weather_csv):
-    dfw = pd.read_csv(weather_csv, parse_dates=['date'])
-    dfw = dfw.sort_values('date').reset_index(drop=True)
-    return dfw
+# ==================== ФУНКЦИИ ЗА ЗАРЕЖДАНЕ НА ДАННИ ====================
+
+def fetch_ibex_day_ahead(start_date: str, end_date: str) -> pd.DataFrame:
+    """
+    Извлича исторически цени Ден Напред от ENTSO-E API.
+    start_date/end_date във формат YYYYMMDD.
+    Връща DataFrame с колони: date, hour_0...hour_23.
+    """
+    url = "https://transparency.entsoe.eu/api"
+    params = {
+        'documentType': 'A44',
+        'in_Domain': '10YBG-ESO------Y',
+        'out_Domain': '10YBG-ESO------Y',
+        'periodStart': start_date + '0000',
+        'periodEnd': end_date + '2300',
+        'securityToken': ENTSOE_API_KEY
+    }
+    response = requests.get(url, params=params)
+    # Потребителят трябва да парсне XML отговор. Тук приемаме, че е конвертиран до CSV.
+    df = pd.read_xml(response.content, xpath='//TimeSeries')
+    # Примерна обработка за трансформиране в wide формат
+    df['date'] = pd.to_datetime(df['timeStamp']).dt.date
+    df['hour'] = pd.to_datetime(df['timeStamp']).dt.hour
+    df_pivot = df.pivot_table(index='date', columns='hour', values='price.amount')
+    df_pivot.columns = [f'hour_{h}' for h in df_pivot.columns]
+    df_pivot = df_pivot.reset_index()
+    return df_pivot
 
 
-def load_ibex_data(price_csv, weather_csv=None):
-    df = pd.read_csv(price_csv, parse_dates=['date'])
-    df = df.sort_values('date').reset_index(drop=True)
-    if weather_csv:
-        dfw = load_weather_data(weather_csv)
-        df = df.merge(dfw, on='date', how='left')
+def fetch_weather_history(lat: float, lon: float, start: datetime, end: datetime) -> pd.DataFrame:
+    """
+    Изтегля агрегирани дневни данни за температура, вятър и радиация.
+    Използва OpenWeatherMap One Call Timemachine.
+    """
+    records = []
+    date = start
+    while date <= end:
+        unix_ts = int(date.timestamp())
+        url = f"https://api.openweathermap.org/data/2.5/onecall/timemachine"
+        params = {
+            'lat': lat,
+            'lon': lon,
+            'dt': unix_ts,
+            'appid': WEATHER_API_KEY,
+            'units': 'metric'
+        }
+        r = requests.get(url, params=params).json()
+        temps = [h['temp'] for h in r['hourly']]
+        winds = [h['wind_speed'] for h in r['hourly']]
+        solar = [h.get('uvi', 0) for h in r['hourly']]
+        records.append({
+            'date': date,
+            'avg_temp': np.mean(temps),
+            'avg_wind_speed': np.mean(winds),
+            'solar_radiation': np.mean(solar)
+        })
+        date += timedelta(days=1)
+    return pd.DataFrame(records)
+
+
+def fetch_weather_forecast(lat: float, lon: float) -> pd.DataFrame:
+    """
+    Изтегля прогноза за следващите 7 дни.
+    """
+    url = f"https://api.openweathermap.org/data/2.5/onecall"
+    params = {
+        'lat': lat,
+        'lon': lon,
+        'exclude': 'current,minutely,hourly,alerts',
+        'appid': WEATHER_API_KEY,
+        'units': 'metric'
+    }
+    j = requests.get(url, params=params).json()
+    records = []
+    for d in j['daily']:
+        records.append({
+            'date': datetime.fromtimestamp(d['dt']).date(),
+            'avg_temp': d['temp']['day'],
+            'avg_wind_speed': d['wind_speed'],
+            'solar_radiation': d.get('uvi', 0)
+        })
+    return pd.DataFrame(records)
+
+
+def load_ibex_and_weather(start_str: str, end_str: str, lat: float, lon: float) -> pd.DataFrame:
+    # IBEX данни
+    df_price = fetch_ibex_day_ahead(start_str, end_str)
+    # Исторически метео
+    start_dt = datetime.strptime(start_str, '%Y%m%d')
+    end_dt = datetime.strptime(end_str, '%Y%m%d')
+    df_weather_hist = fetch_weather_history(lat, lon, start_dt, end_dt)
+    # Merge
+    df = df_price.merge(df_weather_hist, on='date', how='left')
     return df
 
-# ==================== ФИЧЪРИ ====================
-
-def create_features(df):
-    data = df.copy()
-    data['dayofweek'] = data['date'].dt.dayofweek
-    data['is_weekend'] = data['dayofweek'].isin([5,6]).astype(int)
-    for lag in [1, 7]:
-        lag_price = [f'hour_{h}_lag{lag}' for h in range(24)]
-        data[lag_price] = data[[f'hour_{h}' for h in range(24)]].shift(lag)
-    if 'avg_temp' in data.columns:
-        for col in ['avg_temp', 'avg_wind_speed', 'solar_radiation']:
-            data[f'{col}_lag1'] = data[col].shift(1)
-    data = data.dropna().reset_index(drop=True)
-    return data
-
-# ==================== ПОДГОТОВКА ====================
-
-def prepare_dataset(data, target_hour):
-    price_cols = [f'hour_{h}' for h in range(24)]
-    non_features = ['date'] + price_cols
-    X = data.drop(columns=non_features)
-    y = data[f'hour_{target_hour}']
-    return X, y
-
-# ==================== ОБУЧЕНИЕ ====================
-
-def train_model(X, y):
-    tscv = TimeSeriesSplit(n_splits=5)
-    scaler = StandardScaler()
-    X_scaled = scaler.fit_transform(X)
-    maes, rmses = [], []
-    for train_idx, val_idx in tscv.split(X_scaled):
-        X_train, X_val = X_scaled[train_idx], X_scaled[val_idx]
-        y_train, y_val = y.iloc[train_idx], y.iloc[val_idx]
-        model = GradientBoostingRegressor(n_estimators=200, learning_rate=0.05, max_depth=4)
-        model.fit(X_train, y_train)
-        preds = model.predict(X_val)
-        maes.append(mean_absolute_error(y_val, preds))
-        rmses.append(mean_squared_error(y_val, preds, squared=False))
-    return model, scaler, np.mean(maes), np.mean(rmses)
-
-# ==================== ПРОГНОЗА ====================
-
-def forecast_next_day(df_hist, model, scaler):
-    df_feat = create_features(df_hist)
-    last = df_feat.iloc[[-1]].copy()
-    preds = []
-    for hour in range(24):
-        X_pred = last.drop(columns=[f'hour_{h}' for h in range(24)])
-        X_scaled = scaler.transform(X_pred)
-        p = model.predict(X_scaled)[0]
-        preds.append(p)
-        last[f'hour_{hour}_lag1'] = p
-    return preds
-
+# Останалите функции (create_features, prepare_dataset, train_model, forecast_next_day) остават без промяна.
 # ==================== STREAMLIT UI ====================
 
 def main():
-    st.title("IBEX Ден Напред Прогноза на Цени с Метео Фактори")
-    price_file = st.file_uploader("Качете CSV с исторически цени", type="csv")
-    weather_file = st.file_uploader("(По избор) CSV с исторически метео данни", type="csv")
+    st.title("IBEX Ден Напред Прогноза на Цени с Автоматично Зареждане на Данни")
+    years = st.slider("Колко години назад?", 1, 5, 3)
+    lat = st.number_input("Ширина (latitude)", value=42.7)
+    lon = st.number_input("Дължина (longitude)", value=23.3)
 
-    if price_file:
-        df = load_ibex_data(price_file, weather_file)
-        st.subheader("Преглед на данните")
-        st.write(df.head())
+    end = datetime.utcnow().date() - timedelta(days=1)
+    start = end - timedelta(days=365 * years)
+    start_str = start.strftime('%Y%m%d')
+    end_str = end.strftime('%Y%m%d')
 
-        df_feat = create_features(df)
-        st.write(f"След премахване на NaN: {df_feat.shape[0]} реда и {df_feat.shape[1]} колони")
+    with st.spinner("Зареждане на IBEX и метео данни..."):
+        df = load_ibex_and_weather(start_str, end_str, lat, lon)
+    st.success("Данните са заредени")
+    st.write(df.head())
+    
+    df_feat = create_features(df)
+    st.write(f"Feature сет: {df_feat.shape[0]} реда, {df_feat.shape[1]} колони")
 
-        hour = st.slider("Изберете час за прогнозиране", min_value=0, max_value=23, value=0)
-        if st.button("Обучи и валидирай модел"):            
-            X, y = prepare_dataset(df_feat, target_hour=hour)
-            model, scaler, mae, rmse = train_model(X, y)
-            joblib.dump(model, 'model_hour_{}.pkl'.format(hour))
-            joblib.dump(scaler, 'scaler_hour_{}.pkl'.format(hour))
-            st.success(f"Модел обучен. CV MAE: {mae:.3f}, RMSE: {rmse:.3f}")
+    hour = st.slider("Изберете час за прогноза", 0, 23, 0)
+    if st.button("Обучи модел и прогноза"):
+        X, y = prepare_dataset(df_feat, target_hour=hour)
+        model, scaler, mae, rmse = train_model(X, y)
+        st.success(f"Обучено! CV MAE: {mae:.3f}, RMSE: {rmse:.3f}")
 
-        if st.button("Прогнозирай за следващия ден"):
-            model = joblib.load(f'model_hour_{hour}.pkl')
-            scaler = joblib.load(f'scaler_hour_{hour}.pkl')
-            preds = forecast_next_day(df, model, scaler)
-            df_pred = pd.DataFrame({'hour': list(range(24)), 'pred_price': preds})
-            st.line_chart(df_pred.set_index('hour'))
-            st.write(df_pred)
+        # Прогнозиране с weather forecast
+        df_fc_weather = fetch_weather_forecast(lat, lon)
+        df_full = pd.concat([df_price:=df[['date'] + [f'hour_{h}' for h in range(24)]], df_fc_weather], ignore_index=True)
+        preds = forecast_next_day(df_full, model, scaler)
+        df_pred = pd.DataFrame({'hour': range(24), 'pred_price': preds})
+        st.line_chart(df_pred.set_index('hour'))
+        st.write(df_pred)
 
 if __name__ == "__main__":
     main()
+
 
